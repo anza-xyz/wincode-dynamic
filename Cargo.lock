@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "wincode-dynamic-derive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "darling",
  "proc-macro2",

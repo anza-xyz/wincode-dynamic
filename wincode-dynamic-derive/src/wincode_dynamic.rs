@@ -21,7 +21,17 @@ fn validate_variant_tags(variants: &[Variant]) -> Result<()> {
     Ok(())
 }
 
+/// Path to `wincode`, as re-exported by wincode-dynamic.
+///
+/// The generated code must not assume that `wincode` resolves at the expansion
+/// site, since the deriving crate may only depend on a crate that re-exports
+/// wincode-dynamic.
+fn wincode_path(crate_name: &Path) -> TokenStream {
+    quote!(#crate_name::__wincode)
+}
+
 fn field_to_tokens(crate_name: &Path, field: &Field, index: usize) -> TokenStream {
+    let wincode = wincode_path(crate_name);
     let ty = &field.ty;
     let name = match &field.ident {
         Some(ident) => quote!(stringify!(#ident)),
@@ -35,18 +45,18 @@ fn field_to_tokens(crate_name: &Path, field: &Field, index: usize) -> TokenStrea
        #crate_name::FieldDef::new(
            #name,
            <#ty as #crate_name::DynTy>::TYPE,
-           match <#ty as wincode::SchemaRead<wincode::config::DefaultConfig>>::TYPE_META {
-               wincode::TypeMeta::Static { size, .. } => Some(size),
+           match <#ty as #wincode::SchemaRead<#wincode::config::DefaultConfig>>::TYPE_META {
+               #wincode::TypeMeta::Static { size, .. } => Some(size),
                _ => None,
            }
        )
     }
 }
 
-fn field_write_type_meta(field: &Field) -> TokenStream {
+fn field_write_type_meta(wincode: &TokenStream, field: &Field) -> TokenStream {
     if field.skip.is_some() {
         quote! {
-            wincode::TypeMeta::Static {
+            #wincode::TypeMeta::Static {
                 size: 0,
                 zero_copy: false,
             }
@@ -54,7 +64,7 @@ fn field_write_type_meta(field: &Field) -> TokenStream {
     } else {
         let target = field.target_resolved();
         quote! {
-            <#target as wincode::SchemaWrite<wincode::config::DefaultConfig>>::TYPE_META
+            <#target as #wincode::SchemaWrite<#wincode::config::DefaultConfig>>::TYPE_META
         }
     }
 }
@@ -65,6 +75,7 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
         validate_variant_tags(variants)?;
     }
     let crate_name = args.get_crate_name();
+    let wincode = wincode_path(&crate_name);
     let ident = &args.ident;
     let (_, ty_generics, _) = args.generics.split_for_impl();
     let mut impl_generics = args.generics.clone();
@@ -76,13 +87,13 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
         // generic fields annotated with `skip` or `with`.
         where_clause.predicates.push(parse_quote!(
             #ident #ty_generics:
-                wincode::SchemaWrite<wincode::config::DefaultConfig>
+                #wincode::SchemaWrite<#wincode::config::DefaultConfig>
         ));
         where_clause.predicates.push(parse_quote!(
             for<'__wincode_dynamic_de> #ident #ty_generics:
-                wincode::SchemaRead<
+                #wincode::SchemaRead<
                     '__wincode_dynamic_de,
-                    wincode::config::DefaultConfig,
+                    #wincode::config::DefaultConfig,
                 >
         ));
         let mut add_field_bounds = |field: &Field| {
@@ -95,9 +106,9 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
                 .push(parse_quote!(#ty: #crate_name::DynTy));
             where_clause.predicates.push(parse_quote!(
                 for<'__wincode_dynamic_de> #ty:
-                    wincode::SchemaRead<
+                    #wincode::SchemaRead<
                         '__wincode_dynamic_de,
-                        wincode::config::DefaultConfig,
+                        #wincode::config::DefaultConfig,
                         Dst = #ty,
                     >
             ));
@@ -105,8 +116,8 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
             // bytes produced by the field's effective serialization type.
             let target = field.target_resolved();
             where_clause.predicates.push(parse_quote!(
-                #target: wincode::SchemaWrite<
-                    wincode::config::DefaultConfig,
+                #target: #wincode::SchemaWrite<
+                    #wincode::config::DefaultConfig,
                     Src = #ty,
                 >
             ));
@@ -127,7 +138,7 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
         .map(Cow::Borrowed)
         .unwrap_or_else(|| {
             Cow::Owned(parse_quote! {
-                <wincode::config::DefaultConfig as wincode::config::Config>::TagEncoding
+                <#wincode::config::DefaultConfig as #wincode::config::Config>::TagEncoding
             })
         });
     // Keep the const-evaluation machinery local to the anonymous const emitted by
@@ -135,10 +146,10 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
     // wincode-dynamic's public API.
     let max_serialized_size_helper = quote! {
         const fn serialized_size(
-            type_meta: wincode::TypeMeta,
-            fields: &[wincode::TypeMeta],
+            type_meta: #wincode::TypeMeta,
+            fields: &[#wincode::TypeMeta],
         ) -> #crate_name::SerializedSize {
-            if let wincode::TypeMeta::Static { size, .. } = type_meta {
+            if let #wincode::TypeMeta::Static { size, .. } = type_meta {
                 return #crate_name::SerializedSize::Static(size);
             }
 
@@ -147,12 +158,12 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
             let mut field_index = 0usize;
             while field_index < fields.len() {
                 match fields[field_index] {
-                    wincode::TypeMeta::Static { size, .. } => {
+                    #wincode::TypeMeta::Static { size, .. } => {
                         fixed_size = fixed_size
                             .checked_add(size)
                             .expect("serialized size overflow");
                     }
-                    wincode::TypeMeta::Dynamic => is_static = false,
+                    #wincode::TypeMeta::Dynamic => is_static = false,
                 }
                 field_index += 1;
             }
@@ -165,11 +176,11 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
         }
 
         const fn enum_serialized_size(
-            enum_meta: wincode::TypeMeta,
-            tag_meta: wincode::TypeMeta,
+            enum_meta: #wincode::TypeMeta,
+            tag_meta: #wincode::TypeMeta,
             variants: &[#crate_name::SerializedSize],
         ) -> #crate_name::SerializedSize {
-            if let wincode::TypeMeta::Static { size, .. } = enum_meta {
+            if let #wincode::TypeMeta::Static { size, .. } = enum_meta {
                 return #crate_name::SerializedSize::Static(size);
             }
             if variants.is_empty() {
@@ -177,8 +188,8 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
             }
 
             let (tag_size, mut is_static) = match tag_meta {
-                wincode::TypeMeta::Static { size, .. } => (size, true),
-                wincode::TypeMeta::Dynamic => (0, false),
+                #wincode::TypeMeta::Static { size, .. } => (size, true),
+                #wincode::TypeMeta::Dynamic => (0, false),
             };
             let mut maximum_variant_size = 0usize;
             let mut variant_index = 0usize;
@@ -212,10 +223,12 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
     // the contract explicit.
     let max_serialized_size = match &args.data {
         Data::Struct(fields) => {
-            let field_type_metas = fields.iter().map(field_write_type_meta);
+            let field_type_metas = fields
+                .iter()
+                .map(|field| field_write_type_meta(&wincode, field));
             quote! {
                 serialized_size(
-                    <#ident #ty_generics as wincode::SchemaWrite<wincode::config::DefaultConfig>>::TYPE_META,
+                    <#ident #ty_generics as #wincode::SchemaWrite<#wincode::config::DefaultConfig>>::TYPE_META,
                     &[#(#field_type_metas),*],
                 )
             }
@@ -225,10 +238,13 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
             // Aggregate the sequential fields within each variant, then retain
             // the largest known contribution.
             let variant_sizes = variants.iter().map(|variant| {
-                let field_type_metas = variant.fields.iter().map(field_write_type_meta);
+                let field_type_metas = variant
+                    .fields
+                    .iter()
+                    .map(|field| field_write_type_meta(&wincode, field));
                 quote! {
                     serialized_size(
-                        wincode::TypeMeta::Dynamic,
+                        #wincode::TypeMeta::Dynamic,
                         &[#(#field_type_metas),*],
                     )
                 }
@@ -236,8 +252,8 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
 
             quote! {
                 enum_serialized_size(
-                    <#ident #ty_generics as wincode::SchemaWrite<wincode::config::DefaultConfig>>::TYPE_META,
-                    <#tag_encoding as wincode::SchemaWrite<wincode::config::DefaultConfig>>::TYPE_META,
+                    <#ident #ty_generics as #wincode::SchemaWrite<#wincode::config::DefaultConfig>>::TYPE_META,
+                    <#tag_encoding as #wincode::SchemaWrite<#wincode::config::DefaultConfig>>::TYPE_META,
                     &[#(#variant_sizes),*],
                 )
             }
@@ -256,8 +272,8 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
                 #crate_name::RootSchema::Struct(#crate_name::Schema::new(
                     stringify!(#ident),
                     [#(#f),*].into(),
-                    match <#ident #ty_generics as wincode::SchemaRead<wincode::config::DefaultConfig>>::TYPE_META {
-                        wincode::TypeMeta::Static { size, .. } => Some(size),
+                    match <#ident #ty_generics as #wincode::SchemaRead<#wincode::config::DefaultConfig>>::TYPE_META {
+                        #wincode::TypeMeta::Static { size, .. } => Some(size),
                         _ => None,
                     }
                 ))
@@ -280,9 +296,9 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
                         let ty = &field.ty;
                         quote! {
                             .and_then(|total| {
-                                match <#ty as wincode::SchemaRead<wincode::config::DefaultConfig>>::TYPE_META {
-                                    wincode::TypeMeta::Static { size, .. } => total.checked_add(size),
-                                    wincode::TypeMeta::Dynamic => None,
+                                match <#ty as #wincode::SchemaRead<#wincode::config::DefaultConfig>>::TYPE_META {
+                                    #wincode::TypeMeta::Static { size, .. } => total.checked_add(size),
+                                    #wincode::TypeMeta::Dynamic => None,
                                 }
                             })
                         }
@@ -301,9 +317,9 @@ pub(crate) fn generate(input: DeriveInput) -> Result<TokenStream> {
                 #crate_name::RootSchema::Enum {
                     name: stringify!(#ident).into(),
                     variants: [#(#variants),*].into(),
-                    size: match <#ident #ty_generics as wincode::SchemaRead<wincode::config::DefaultConfig>>::TYPE_META {
-                        wincode::TypeMeta::Static { size, .. } => Some(size),
-                        wincode::TypeMeta::Dynamic => None,
+                    size: match <#ident #ty_generics as #wincode::SchemaRead<#wincode::config::DefaultConfig>>::TYPE_META {
+                        #wincode::TypeMeta::Static { size, .. } => Some(size),
+                        #wincode::TypeMeta::Dynamic => None,
                     },
                     tag_encoding: <#tag_encoding as #crate_name::DynPrimitiveTy>::TYPE,
                 }

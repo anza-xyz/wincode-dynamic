@@ -13,6 +13,10 @@ mod compile_fail;
 mod ty;
 mod value;
 mod wincode_extra;
+// Used by the derive, so that deriving crates don't need a direct dependency on
+// wincode.
+#[doc(hidden)]
+pub use wincode as __wincode;
 #[cfg(feature = "derive")]
 pub use wincode_dynamic_derive::*;
 pub use {ty::*, value::*};
